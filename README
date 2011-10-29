@@ -1,0 +1,2 @@
+A collection of EC2 tools which leverage boto (http://code.google.com/p/boto/)
+to do EC2 instance bootstrapping.
