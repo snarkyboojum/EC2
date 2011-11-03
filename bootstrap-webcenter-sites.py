@@ -58,7 +58,7 @@ logger.setLevel(logging.DEBUG)
 
 
 def main():
-    # retrive our user data JSON from the instance user data
+    # retrieve our user data JSON for the instance
     try:
         json_data = get_userdata_json()
     except boto.exception.AWSConnectionError, e:
@@ -79,6 +79,21 @@ def main():
     else:
         return 1
 
+    # TODO: not sure there is a way to get the current instance id using boto...
+    #instance_id = urllib.urlopen("http://169.254.169.254/latest/meta-data/instance-id").read()
+    instance_id = os.environ['INSTANCE_ID']
+    region = os.environ['AWS_REGION']
+    zone   = os.environ['AWS_AZ']
+    ec2    = boto.ec2.connect_to_region(region)
+
+    # create and attach app volume if supplied
+    if 'app_vol' in json_data['bootstrap']:
+        app_vol = json_data['bootstrap']['app_vol']
+        try:
+            vol_created = create_attach_app_vol(ec2, instance_id, region, zone, app_vol)
+        except Exception, e:
+            return 1
+
     # retrieve bootstrapping bundle from S3 (returns a file path)
     bundle_path = get_bundle(bucket_name, bundle_name, '/tmp')
 
@@ -95,7 +110,7 @@ def main():
     # set metadata iff it was supplied in user data
     if 'bootstrap' in json_data and 'metadata' in json_data['bootstrap']:
         metadata = json_data['bootstrap']['metadata']
-        set_metadata(metadata)
+        set_metadata(ec2, instance_id, metadata)
 
     # start the application service(s) if required
     if 'bootstrap' in json_data and 'services' in json_data['bootstrap']:
@@ -174,9 +189,19 @@ def migrate_file(config, file):
         print line,
 
 
+# configure and start all required services
 def start_services(services):
-    # start all required services
     for service in services:
+        # ensure we can run it - set perms to 755
+        service_script = os.path.normpath(os.path.join('/etc', 'init.d', service))
+        script_perm = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
+        os.chmod(service_script, script_perm)
+
+        # turn the service "on" with chkconfig
+        retcode = subprocess.call(['chkconfig', service, 'on'])
+        retcode = subprocess.call(['chkconfig', service, 'reset'])
+
+        # run it!
         retcode = subprocess.call(['service', service, 'start'])
 
         try:
@@ -188,17 +213,11 @@ def start_services(services):
             return 1
 
 
-def set_metadata(metadata):
-    # check if we have instance metadata to set - that's all we support anyway
+# set instance metadata - that's all we support anyway
+def set_metadata(ec2, instance_id, metadata):
     if 'instance' in metadata:
-
-        region = os.environ['AWS_REGION']
-        ec2 = boto.ec2.connect_to_region(region)
         instance_metadata = metadata['instance']
-
-        # TODO: not sure there is a way to get the current instance id using boto...
-        instance_id = urllib.urlopen("http://169.254.169.254/latest/meta-data/instance-id").read()
-        resources   = [instance_id]
+        resources = [instance_id]
 
         if not ec2.create_tags(resources, instance_metadata):
             print >> sys.stderr, "Couldn't tag instance: " + instance_id
@@ -226,6 +245,40 @@ def get_userdata_json():
 
     return json_data
 
+
+def create_attach_app_vol(ec2, instance_id, region, zone, app_vol):
+
+    # check that we have enough information to continue
+    if 'dev_name' in app_vol and 'mount_point' in app_vol and 'snapshot_id' in app_vol and 'vol_size' in app_vol:
+        dev_name    = app_vol['dev_name']
+        mount_point = app_vol['mount_point']
+        snapshot_id = app_vol['snapshot_id']
+        vol_size    = app_vol['vol_size']
+    else:
+        raise Exception("Couldn't create application volume");
+
+    if 'delete_on_terminate' in app_vol:
+        delete_on_terminate = app_vol['delete_on_terminate']
+
+    # create a volume based off the snapshot
+    vol_id = ec2.create_volume(vol_size, zone, snapshot_id)
+
+    # attach it to the running instance
+    ec2.attach_volume(vol_id, instance_id, dev_name)
+
+    # mount the volume
+    retcode = subprocess.call(['mount', mount_point])
+
+    # set volume to delete when we terminate the instance
+    # run something like:
+    #   ec2-modify-instance-attribute --region us-west-1 --block-device-mapping /dev/sdi=:true i-dba8139c
+    if delete_on_terminate == 'true':
+        retcode = subprocess.call(['ec2-modify-instance-attribute',
+                                   '--region', region,
+                                   '--block-device-mapping', dev_name + '=:true',
+                                   instance_id])
+
+    #TODO: check that we have an attached volume correctly
 
 
 if __name__ == '__main__':
