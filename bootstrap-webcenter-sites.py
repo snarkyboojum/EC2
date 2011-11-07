@@ -32,6 +32,8 @@ import boto.utils
 from boto.s3.key import Key
 
 import sys
+import time
+import stat
 import os.path
 import urllib
 import subprocess
@@ -79,7 +81,6 @@ def main():
     else:
         return 1
 
-    # TODO: not sure there is a way to get the current instance id using boto...
     #instance_id = urllib.urlopen("http://169.254.169.254/latest/meta-data/instance-id").read()
     instance_id = os.environ['INSTANCE_ID']
     region = os.environ['AWS_REGION']
@@ -88,33 +89,35 @@ def main():
 
     # create and attach app volume if supplied
     if 'app_vol' in json_data['bootstrap']:
+        print "Creating an attaching app volume from snapshot"
         app_vol = json_data['bootstrap']['app_vol']
-        try:
-            vol_created = create_attach_app_vol(ec2, instance_id, region, zone, app_vol)
-        except Exception, e:
-            return 1
+        vol_created = create_attach_app_vol(ec2, instance_id, region, zone, app_vol)
 
+    print "Retrieving bundle from S3"
     # retrieve bootstrapping bundle from S3 (returns a file path)
     bundle_path = get_bundle(bucket_name, bundle_name, '/tmp')
 
     # explode it
     if os.path.exists(bundle_path):
+        print "Exploding bundle"
         exploded_bundle_path = explode_bundle(bundle_path)
     else:
-        print >>sys.stderr, "Didn't get bootstrapping bundle"
-        return 1
+        raise Exception("Didn't save bootstrapping bundle to: " + bundle_path)
 
     # bootstrap!
+    print "Bootstrapping!"
     bootstrap(exploded_bundle_path)
 
     # set metadata iff it was supplied in user data
     if 'bootstrap' in json_data and 'metadata' in json_data['bootstrap']:
         metadata = json_data['bootstrap']['metadata']
-        set_metadata(ec2, instance_id, metadata)
+        print "Setting metadata on instance and volumes"
+        set_metadata(ec2, instance_id, zone, metadata)
 
     # start the application service(s) if required
     if 'bootstrap' in json_data and 'services' in json_data['bootstrap']:
         services = json_data['bootstrap']['services']
+        print "Enabling and starting services"
         start_services(services)
 
 
@@ -127,6 +130,7 @@ def get_bundle(bucket_name, bundle_name, to_path):
         bucket = s3_conn.get_bucket(bucket_name)
     except Exception, e:
         print >>sys.stderr, "Exception:", e
+        raise
     else:
         k = Key(bucket)
         k.key = bundle_name
@@ -204,35 +208,34 @@ def start_services(services):
         # run it!
         retcode = subprocess.call(['service', service, 'start'])
 
-        try:
-            if retcode != 0:
-                print >>sys.stderr, "Starting " + service + " returned a non-zero exit code"
-                raise OSError(retcode, "Starting " + service + " returned non-zero exit code")
-        except OSError, e:
-            print >>sys.stderr, "Execution failed:", e
-            return 1
+        if retcode != 0:
+            print >>sys.stderr, "Starting " + service + " returned a non-zero exit code"
+            raise OSError(retcode, "Starting " + service + " returned non-zero exit code")
 
 
 # set instance metadata - that's all we support anyway
-def set_metadata(ec2, instance_id, metadata):
+def set_metadata(ec2, instance_id, zone, metadata):
     if 'instance' in metadata:
         instance_metadata = metadata['instance']
         resources = [instance_id]
+
+        # append zone to the name before tagging
+        if 'Name' in instance_metadata and zone != '':
+            instance_metadata['Name'] += ' - ' + zone
 
         if not ec2.create_tags(resources, instance_metadata):
             print >> sys.stderr, "Couldn't tag instance: " + instance_id
             raise Exception("Couldn't tag instance: " + instance_id);
 
-        # we'll also tag volumes with the instance name metadata if it's available
-        m = ec2.get_instance_metadata()
+        # this doesn't seem inefficient - should be a way to query instance volumes directly
+        volumes = [v.id for v in ec2.get_all_volumes() if v.attach_data.instance_id == instance_id]
 
-        # TODO: this doesn't seem inefficient - should be a way to query instance volumes directly
-        volumes = [v for v in ec2.get_all_volumes() if v.attach_data.instance_id == m['instance-id']]
-
-        if 'name' in instance_metadata:
-            if not ec2.create_tags(volumes, {instance_metadata['name']}):
-                print >> sys.stderr, "Couldn't tag volumes with instance name: " + instance_metadata['name']
-                raise Exception("Couldn't tag volumes with instance name: " + instance_metadata['name']);
+        # metadata keys are case-sensitive - we assume that if the user wants to tag the name
+        # of assets, they've used 'Name' because that's the only one that works
+        if 'Name' in instance_metadata:
+            if not ec2.create_tags(volumes, {'Name': instance_metadata['Name']}):
+                print >> sys.stderr, "Couldn't tag volumes with instance name: " + instance_metadata['Name']
+                raise Exception("Couldn't tag volumes with instance name: " + instance_metadata['Name']);
 
 
 # get user data which is assumed to be JSON, parse it and return a JSON object
@@ -247,7 +250,6 @@ def get_userdata_json():
 
 
 def create_attach_app_vol(ec2, instance_id, region, zone, app_vol):
-
     # check that we have enough information to continue
     if 'dev_name' in app_vol and 'mount_point' in app_vol and 'snapshot_id' in app_vol and 'vol_size' in app_vol:
         dev_name    = app_vol['dev_name']
@@ -260,19 +262,32 @@ def create_attach_app_vol(ec2, instance_id, region, zone, app_vol):
     if 'delete_on_terminate' in app_vol:
         delete_on_terminate = app_vol['delete_on_terminate']
 
-    # create a volume based off the snapshot
-    vol_id = ec2.create_volume(vol_size, zone, snapshot_id)
+   # TODO: check that we don't already have a volume created and attached
 
-    # attach it to the running instance
-    ec2.attach_volume(vol_id, instance_id, dev_name)
+    # create a volume based off the snapshot and attach it
+    print "   creating volume..."
+    vol = ec2.create_volume(vol_size, zone, snapshot_id)
+    print "   attaching volume..."
+    vol.attach(instance_id, dev_name)
 
-    # mount the volume
-    retcode = subprocess.call(['mount', mount_point])
+    # try up to 5 times to mount (giving the attach time to finish)
+    for retries in range(0, 5):
+        # give the attach time to finish
+        time.sleep(5)
+
+        print "Trying to mount..."
+        # mount the volume and break if we're successful
+        retcode = subprocess.call(['mount', mount_point])
+        if retcode == 0:
+            break
+
+    print "Mounted app volume successfully"
 
     # set volume to delete when we terminate the instance
     # run something like:
     #   ec2-modify-instance-attribute --region us-west-1 --block-device-mapping /dev/sdi=:true i-dba8139c
     if delete_on_terminate == 'true':
+        print "Setting delete on terminate"
         retcode = subprocess.call(['ec2-modify-instance-attribute',
                                    '--region', region,
                                    '--block-device-mapping', dev_name + '=:true',
