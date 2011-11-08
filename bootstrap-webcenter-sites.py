@@ -1,28 +1,66 @@
-#! /usr/bin/env python
+#!/usr/local/bin/python
 
-# This script bootstraps a WebCentre Sites Remote Satellite Server
-# EC2 instance.
+# This script bootstraps a WebCentre Sites EC2 instance. Depending on
+# what is supplied to the script, it will build an application volume
+# from a snapshot, download relevant configuration from S3, and
+# configure a Remote Satellite Server instance, a Delivery Content
+# Server instance or an Authoring Content Server instance - or anything
+# else you put your mind to.
 #
-# The script retrieves a bootstrapping bundle (a zip file) from S3
-# containing a a bootstrapping file list and a property file.
-# The bootstrapping file list contains a list of files that need
-# to be "bootstrapped" with host specific information, and the property
-# file provides a mapping from properties which exist as placeholders
-# in the virgin instance, to (optionally) default values which will
-# replace placeholders in the install base for the virgin instance.
+# The build and configuration process is defined via instance user data.
+#
+# For example, if the following user data is provided at bootstrap:
+#
+# {
+#     "bootstrap": {
+#
+#         ...
+#
+#         "bundle_name": "bootstrap-cs-del-bundle.zip",
+#
+#         "metadata": {
+#             "instance": {
+#                 "Name": "VCA DELIVERY CONTENT SERVER"
+#             }
+#         },
+#
+#         "app_vol" : {
+#             "dev_name": "/dev/sdi",
+#             "mount_point": "/hta",
+#             "snapshot_id": "snap-209a804e",
+#             "vol_size": 100,
+#             "delete_on_terminate": "true"
+#         },
+#
+#         "services": ["cs_tomcat"]
+# }
+#
+# then the script will build an EBS volume, attach it to the instance,
+# and mount the disk, as per the configuration supplied in 'app_vol'.
+#
+# It will then retrieve a bootstrapping bundle (a zip file) from S3, in
+# this case 'bootstrap-cs-del-bundle.zip', which by convention contains a
+# bootstrapping file list and a property file called 'bootstrap.filelist'
+# and 'bootstrap.properties' respectively. The bootstrapping file list
+# contains a list of files that need to be "bootstrapped" or configured
+# with host or environment specific information, and the property file
+# provides a mapping for placeholders to (optionally) default values.
 #
 # If values are defined for placeholders in the properties file,
 # those values are used for the associated placeholder. For all other
-# undefined placeholders, EC2 metadata is interrogated and the results
-# are used. If after interrogating EC2 metadata there exist undefined
-# property values, the bootstrapping script stops with an error.
+# placeholders with values matching ec2_metadata\.(.+), EC2 metadata is
+# interrogated and the value captured in the regex above is used as the
+# value. If after interrogating EC2 metadata there exist undefined property
+# values, the bootstrapping script stops with an error.
 #
 # Once all property values are defined, the bootstrap script loops
 # through the list of files specified in the file list and replaces
-# instances of the placeholder with an associated value.
+# instances of the placeholder with an associated value. In this way,
+# the application volume can be configured as can any other file on the
+# filesystem.
 #
-# Finally, the script attempts to start application services. If this
-# succeeds, the EC2 instance has been bootstrapped.
+# Finally, the script attempts to install and start application services.
+# If this succeeds, the EC2 instance has been bootstrapped.
 #
 
 
@@ -31,6 +69,7 @@ import boto.ec2
 import boto.utils
 from boto.s3.key import Key
 
+import re
 import sys
 import time
 import stat
@@ -48,7 +87,7 @@ import simplejson as json
 AMI_FILELIST = 'bootstrap.filelist'
 # a template of properties to migrate
 AMI_PROPERTIES = 'bootstrap.properties'
-LOG_FILE = 'ami-bootstrap.log'
+LOG_FILE = '/etc/ami-bootstrap.log'
 
 # set up logging
 logger = logging.getLogger('ami-bootstrap')
@@ -87,6 +126,9 @@ def main():
     zone   = os.environ['AWS_AZ']
     ec2    = boto.ec2.connect_to_region(region)
 
+    if not instance_id or not region or not zone:
+        raise Exception("Couldn't retrieve environment information. Can't continue bootstrapping.")
+
     # create and attach app volume if supplied
     if 'app_vol' in json_data['bootstrap']:
         print "Creating an attaching app volume from snapshot"
@@ -106,7 +148,7 @@ def main():
 
     # bootstrap!
     print "Bootstrapping!"
-    bootstrap(exploded_bundle_path)
+    bootstrap(ec2, instance_id, exploded_bundle_path)
 
     # set metadata iff it was supplied in user data
     if 'bootstrap' in json_data and 'metadata' in json_data['bootstrap']:
@@ -161,7 +203,7 @@ def explode_bundle(bundle_path):
 
 
 # run the bootstrapping logic
-def bootstrap(bundle_path):
+def bootstrap(ec2, instance_id, bundle_path):
     print "Ready to run bootstrap using extracted bundle in: " + bundle_path
 
     properties_file = os.path.join(bundle_path, AMI_PROPERTIES)
@@ -172,20 +214,43 @@ def bootstrap(bundle_path):
     config.optionxform = str
     config.read(properties_file)
 
+
+    # let's get a handle on the current instance so we can retrieve metadata during bootstrap
+    # yes - boto really makes you get the first element in the result set, and then use the first
+    # element in the instances list for that, to get at the instance :S
+    instance = ec2.get_all_instances(instance_id)[0].instances[0]
+
     # loop through ami filelist applying filters/patches to it
-    for line in open(filelist_file, 'r'):
-        line = line.rstrip('\n')
-        migrate_file(config, line)
+    for file in open(filelist_file, 'r'):
+        file = file.rstrip('\n')
+        if os.path.exists(file):
+            migrate_file(instance, config, file)
 
 
 # migrate a file
-def migrate_file(config, file):
+def migrate_file(instance, config, file):
     logger.info(file)
 
-    # open file and do search and replace for each key/value pair
+    # open file and do an inplace search and replace for each key/value pair
     for line in fileinput.FileInput(file, inplace=1):
 
+        # N.B. if the value for a key matches ec2-metadata.(.*) then we retrieve the value
+        # by looking up the instance metadata value using whatever is captured in the regex as
+        # the key or attribute
+        #
+        # i.e. we use getattr to get an attribute of that name from our instance object
+        #
         for key, value in config.items('host_config'):
+
+            m = re.search('^ec2\-metadata\.(.+)$', value)
+            if m and m.group(1):
+                instance_metadata_key = m.group(1)
+                instance_metadata_value = getattr(instance, instance_metadata_key)
+                if instance_metadata_value:
+                    value = instance_metadata_value
+                else:
+                    raise Exception("Couldn't retrieve EC2 instance metadata for key: " + key)
+
             if key in line:
                 logger.debug('Replacing ' + key + ' with ' + value + ' in line: ' + line)
                 line = line.replace(key, value)
@@ -257,12 +322,12 @@ def create_attach_app_vol(ec2, instance_id, region, zone, app_vol):
         snapshot_id = app_vol['snapshot_id']
         vol_size    = app_vol['vol_size']
     else:
-        raise Exception("Couldn't create application volume");
+        raise Exception("Not enough information to create application volume");
 
     if 'delete_on_terminate' in app_vol:
         delete_on_terminate = app_vol['delete_on_terminate']
 
-   # TODO: check that we don't already have a volume created and attached
+    # TODO: check that we don't already have a volume created and attached
 
     # create a volume based off the snapshot and attach it
     print "   creating volume..."
@@ -288,10 +353,19 @@ def create_attach_app_vol(ec2, instance_id, region, zone, app_vol):
     #   ec2-modify-instance-attribute --region us-west-1 --block-device-mapping /dev/sdi=:true i-dba8139c
     if delete_on_terminate == 'true':
         print "Setting delete on terminate"
+
+        # a vain attempt to make sure we can change the instance attribute to delete our app volume
+        # on termination of the instance
+        time.sleep(10)
+
         retcode = subprocess.call(['ec2-modify-instance-attribute',
                                    '--region', region,
                                    '--block-device-mapping', dev_name + '=:true',
                                    instance_id])
+
+        # FIXME: changing this attribute at boot time doesn't work at the moment
+        #if retcode != 0:
+        #    raise Exception("Couldn't set delete on terminate attribute for app volume", retcode)
 
     #TODO: check that we have an attached volume correctly
 
