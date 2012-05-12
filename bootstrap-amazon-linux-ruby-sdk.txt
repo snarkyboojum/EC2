@@ -1,8 +1,17 @@
+# get gem and install it
 wget http://rubyforge.org/frs/download.php/76073/rubygems-1.8.24.tgz
 tar zxvpf rubygems-1.8.24.tgz     
 cd rubygems-1.8.24
-sudo ruby setup.rb    
+sudo ruby setup.rb
+
+# we need basic stuff like gcc - so indiscriminately do that
 sudo yum groupinstall "Development Tools"
+
+# header files
 sudo yum install ruby-devel libxml2-devel libxslt-devel
+
+# for rdoc
 sudo yum install ruby-irb ruby-rdoc ruby-ri
+
+# finally install the thing
 sudo gem install aws-sdk
