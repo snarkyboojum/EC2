@@ -1,0 +1,8 @@
+wget http://rubyforge.org/frs/download.php/76073/rubygems-1.8.24.tgz
+tar zxvpf rubygems-1.8.24.tgz     
+cd rubygems-1.8.24
+sudo ruby setup.rb    
+sudo yum groupinstall "Development Tools"
+sudo yum install ruby-devel libxml2-devel libxslt-devel
+sudo yum install ruby-irb ruby-rdoc ruby-ri
+sudo gem install aws-sdk
